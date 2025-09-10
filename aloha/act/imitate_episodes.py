@@ -126,7 +126,7 @@ def main(args):
     }
 
     if is_eval:
-        ckpt_names = [f"policy_last.ckpt"]  # 10000 for insertion, 6500 for transfer
+        ckpt_names = [f"policy_last.ckpt"]  
         results = []
         for ckpt_name in ckpt_names:
             success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
@@ -138,7 +138,7 @@ def main(args):
         exit()
     
     if is_label:
-        ckpt_names = [f"policy_best.ckpt"]  # 10000 for insertion, 6500 for transfer
+        ckpt_names = [f"policy_last.ckpt"]  
         results = []
         for ckpt_name in ckpt_names:
             label_entropy(config, ckpt_name, save_episode=True)
@@ -372,14 +372,8 @@ def label_entropy(config, ckpt_name, save_demos=False,save_episode=True):
     
 
 
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import rbf_kernel
-from scipy.sparse.linalg import eigsh
-from sklearn.metrics import silhouette_score
-from sklearn.cluster import KMeans
-import hdbscan
-from sklearn.datasets import make_blobs
 
+import hdbscan
 
 def hdbscan_with_custom_merge(X, dir, rollout_id, plot=True):
    

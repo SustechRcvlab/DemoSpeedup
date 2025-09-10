@@ -40,7 +40,7 @@ Please download scripted/human demo for simulated environments from [here](https
 
 
 ### Usage
-Please replace `[TASK]` with your desired task to train, `[TASK]={ sim_transfer_cube_human, sim_insertion_human}`; Replace `[ALGO]` with your desired algorithm, `[ALGO]={ACT, DP}`; Replace `[Batch_Size]` with corresponding number, where we recommend `[Batch_Size]=8` for ACT and `[Batch_Size]=40` for DP; Use `[Chunk_Size]=50` for ACT and `[Chunk_Size]=48` for DP.
+Please replace `[TASK]` with your desired task to train, `[TASK]={ sim_transfer_cube_human, sim_insertion_human}`; Replace `[ALGO]` with your desired algorithm, `[ALGO]={ACT, DP}`; Replace `[Batch_Size]` with corresponding number, where we recommend `[Batch_Size]=8` for ACT and `[Batch_Size]=40` for DP; Use `[Chunk_Size]=50` for ACT and `[Chunk_Size]=48` for DP during proxy policy training.
 
 
 ### Train proxy policy
@@ -58,7 +58,6 @@ We recommend `[Chunk_Size]=25` for ACT and `[Chunk_Size]=24` for DP to maintain 
 python act/imitate_episodes.py --task_name [TASK] --ckpt_dir data/outputs/[ALGO]_speedup_ckpt/[TASK] --policy_class [ALGO] --kl_weight 10 --chunk_size [Chunk_Size] --hidden_dim 512 --batch_size [Batch_Size] --dim_feedforward 3200 --num_epochs 16000 --lr 1e-5 --seed 0 --temporal_agg   --speedup
 ```
 ### Eval accelerated policy 
-During evaluation, we recommend to adopt `--temporal_agg` for ACT and discard it for DP.
 ```bash
 python act/imitate_episodes.py --task_name [TASK] --ckpt_dir data/outputs/[ALGO]_speedup_ckpt/[TASK] --policy_class [ALGO] --kl_weight 10 --chunk_size [Chunk_Size] --hidden_dim 512 --batch_size [Batch_Size] --dim_feedforward 3200 --num_epochs 16000 --lr 1e-5 --seed 0 --temporal_agg  --speedup --eval
 ```
