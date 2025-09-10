@@ -103,5 +103,7 @@ python3 train.py launch=dp_pixel_bigym env=bigym/sandwich_remove speedup=True
 
 See the full list of task names in `robobase/robobase/cfgs/env/bigym`. The evaluation results are saved in  `robobase/exp_local`.
 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
 If you encountered any issue, feel free to contact lingxiag@andrew.cmu.edu.
 
