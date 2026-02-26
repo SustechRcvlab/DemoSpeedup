@@ -4,6 +4,7 @@
 
 1. [问题一：DemoSpeedup 与其他下采样方法对比时是否控制了总轨迹长度一致](#问题一demospeedup-与其他下采样方法对比时是否控制了总轨迹长度一致)
 2. [问题二：对比的下采样方法详细介绍](#问题二对比的下采样方法详细介绍)
+3. [Section 7.1：与其他演示加速方法的详细对比](#section-71与其他演示加速方法的详细对比)
 
 ---
 
@@ -511,3 +512,535 @@ $$
 $$
 \text{memo}[i] = \min_{k \in [\max(1, i-4), i)} \left(1 + \text{memo}[k].\text{count}\right) \quad \text{s.t.} \quad \forall t \in [k, i]: e_t \leq \epsilon_t
 $$
+
+---
+
+## Section 7.1：与其他演示加速方法的详细对比
+
+本节重点分析论文 Section 7.1 中 DemoSpeedup 与四种基线下采样方法的对比。这四种方法用于替换 DemoSpeedup 中的熵引导分段加速模块，所有方法在相同的实验环境和评估标准下进行比较。
+
+### 对比方法概览
+
+| 方法 | 类型 | 下采样方式 | 是否需要 Oracle/先验 | 代码位置 |
+|------|------|-----------|---------------------|---------|
+| **Contact Oracle** | 基于接触的启发式 | 接触事件驱动的精度分区 | ✅ 需要 3D 接触信息 | `sim_env.py` 中的接触检测逻辑 |
+| **AWE\*** | 动态规划 + 熵加权 | 调整阈值使轨迹缩短至 2× | ❌ | `awe_entropy.py: dp_waypoint_selection()` / `dp_entropy_waypoint_selection()` |
+| **恒定 2×** | 均匀下采样 | 每隔 1 帧取样 | ❌ | `uniform_replay_buffer.py` 第 840 行（注释） |
+| **恒定 3×** | 均匀下采样 | 每隔 2 帧取样 | ❌ | 类似 `action[::3]` |
+
+---
+
+### 基线方法一：Contact Oracle（基于接触的 Oracle 标签）
+
+#### 方法描述
+
+Contact Oracle 是一种基于仿真器**接触信息（contact information）**的启发式方法，用于将轨迹划分为**高精度区域**和**低精度区域**。其核心假设是：**物体接触状态发生变化的时刻（如夹爪抓取物体、物体放置到另一物体上）前后需要高精度控制**，其余时段可以使用低精度（即可大步跳帧）。
+
+#### 划分规则
+
+在操作场景中，系统监测所有物体对（geom pair）的接触状态。当检测到以下事件时，标记该时刻前后的固定时间窗口为**高精度区域**：
+
+1. **新的物体对接触事件**：例如夹爪手指与目标物体首次接触
+2. **物体脱离事件**：例如物体从桌面抬起（不再接触桌面）
+3. **物体间接触变化**：例如目标物体与放置位置首次接触
+
+其余时间段标记为**低精度区域**。
+
+#### 代码中的接触检测逻辑
+
+Contact Oracle 的核心依赖仿真器提供的接触对（contact pair）信息。在代码中，这些接触检测逻辑已在 reward 函数中实现（用于评估任务完成度），相同的逻辑可以直接复用于 Contact Oracle 标签生成。
+
+**代码位置：** `aloha/act/sim_env.py`
+
+##### TransferCube 任务的接触检测（第 204-234 行）
+
+```python
+def get_reward(self, physics):
+    # 获取所有接触对
+    all_contact_pairs = []
+    for i_contact in range(physics.data.ncon):
+        id_geom_1 = physics.data.contact[i_contact].geom1
+        id_geom_2 = physics.data.contact[i_contact].geom2
+        name_geom_1 = physics.model.id2name(id_geom_1, "geom")
+        name_geom_2 = physics.model.id2name(id_geom_2, "geom")
+        contact_pair = (name_geom_1, name_geom_2)
+        all_contact_pairs.append(contact_pair)
+
+    # 检测各类接触事件
+    touch_left_gripper = ("red_box", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+    touch_right_gripper = ("red_box", "vx300s_right/10_right_gripper_finger") in all_contact_pairs
+    touch_table = ("red_box", "table") in all_contact_pairs
+```
+
+##### Insertion 任务的接触检测（第 259-312 行）
+
+```python
+def get_reward(self, physics):
+    # ...检测接触对...
+    touch_right_gripper = ("red_peg", "vx300s_right/10_right_gripper_finger") in all_contact_pairs
+    touch_left_gripper = (
+        ("socket-1", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+        or ("socket-2", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+        # ...更多 socket 变体...
+    )
+    peg_touch_table = ("red_peg", "table") in all_contact_pairs
+    peg_touch_socket = (
+        ("red_peg", "socket-1") in all_contact_pairs
+        or ("red_peg", "socket-2") in all_contact_pairs
+        # ...更多组合...
+    )
+    pin_touched = ("red_peg", "pin") in all_contact_pairs
+```
+
+#### 伪代码
+
+```
+输入: 演示轨迹 D = {(s_0, a_0), ..., (s_{T-1}, a_{T-1})}, 时间窗口 Δt
+输出: 标签序列 labels[0..T-1], 其中 0=高精度, 1=低精度
+
+# 初始化所有帧为低精度
+labels = [1] * T
+
+# 记录上一时刻的接触状态集合
+prev_contacts = get_contact_pairs(s_0)
+
+for t = 1 to T-1:
+    curr_contacts = get_contact_pairs(s_t)
+
+    # 检测新增接触对（新物体接触事件）
+    new_contacts = curr_contacts - prev_contacts
+    # 检测消失接触对（物体脱离事件）
+    lost_contacts = prev_contacts - curr_contacts
+
+    if new_contacts ≠ ∅ OR lost_contacts ≠ ∅:
+        # 在接触变化时刻前后 Δt 帧标记为高精度
+        for τ = max(0, t - Δt) to min(T-1, t + Δt):
+            labels[τ] = 0  # 高精度
+
+    prev_contacts = curr_contacts
+
+return labels
+```
+
+#### 对于 TransferCube 任务的具体接触事件
+
+| 接触事件 | 含义 | 对应 contact pair |
+|---------|------|------------------|
+| 右夹爪抓取方块 | `touch_right_gripper` | `("red_box", "vx300s_right/10_right_gripper_finger")` |
+| 方块离开桌面 | `NOT touch_table` | `("red_box", "table")` 消失 |
+| 左夹爪接收方块 | `touch_left_gripper` | `("red_box", "vx300s_left/10_left_gripper_finger")` |
+| 方块传递完成 | `touch_left_gripper AND NOT touch_table` | 组合条件 |
+
+#### 对于 Insertion 任务的具体接触事件
+
+| 接触事件 | 含义 | 对应 contact pair |
+|---------|------|------------------|
+| 双手分别抓取peg和socket | `touch_left_gripper AND touch_right_gripper` | 多个 socket/peg geom 组合 |
+| 双手同时抬起 | 离开桌面 | `peg_touch_table`/`socket_touch_table` 消失 |
+| peg 接触 socket | 对准阶段 | `("red_peg", "socket-*")` 出现 |
+| peg 插入到 pin | 完成插入 | `("red_peg", "pin")` 出现 |
+
+#### 局限性
+
+- **依赖 Oracle 信息**：需要仿真器提供精确的 3D 接触对信息（`physics.data.contact`），真实世界中无法直接获取
+- **依赖精确的 3D 先验**：需要预先知道所有物体的 geom 名称和可能的接触对
+- **不适用于仅有 2D 相机输入的真实场景**
+
+---
+
+### 基线方法二：AWE*（动态规划路标选择 + 熵加权）
+
+#### 方法描述
+
+AWE*（Adjusted AWE with entropy weighting）基于 AWE（Action Waypoints from Entropy）方法的动态规划框架，但做了两个关键调整：
+
+1. **调整阈值使轨迹缩短至约 2×**：原始 AWE 旨在提升成功率，其选择的路标点到达时间可能远长于原始演示。AWE* 调整了误差阈值 $\epsilon$，使得下采样后的轨迹长度大致为原始长度的一半。
+2. **引入熵对近似误差进行加权**：原始 AWE 仅依赖关节角度轨迹的几何误差，AWE* 通过熵对每个时间步的误差阈值进行加权，使得高熵（低确定性）区域保留更多路标点。
+
+#### 核心代码
+
+AWE* 的基础实现对应 `dp_waypoint_selection()`，熵加权版本对应 `dp_entropy_waypoint_selection()`。
+
+**代码位置：** `aloha/act/awe_entropy.py`
+
+##### dp_waypoint_selection()（基础 AWE DP，第 10-100 行）
+
+这是不使用熵加权的基础版本：
+
+```python
+def dp_waypoint_selection(
+    env=None, actions=None, gt_states=None,
+    err_threshold=None, initial_states=None,
+    remove_obj=None, pos_only=False,
+):
+    if actions is None:
+        actions = copy.deepcopy(gt_states)
+    elif gt_states is None:
+        gt_states = copy.deepcopy(actions)
+
+    num_frames = len(actions)
+    initial_waypoints = [num_frames - 1]  # 最后一帧为路标
+
+    memo = {}
+    func = fast_geometric_waypoint_trajectory
+    distance_func = (
+        get_all_pos_only_geometric_distance_gpu if pos_only
+        else get_all_geometric_distance_gpu
+    )
+    all_distance = distance_func(gt_states)
+
+    # 初始化
+    for i in range(num_frames):
+        memo[i] = (0, [])
+    memo[1] = (1, [1])
+
+    # 自底向上 DP
+    for i in range(2, num_frames):
+        min_waypoints_required = float("inf")
+        best_waypoints = []
+        for k in range(1, i):  # 搜索所有可能的分割点
+            waypoints = [j - k for j in initial_waypoints if j >= k and j < i] + [i - k]
+            total_traj_err = func(
+                actions=actions[k:i+1], gt_states=gt_states[k:i+1],
+                waypoints=waypoints,
+                all_distance=all_distance[k:i+1, k:i+1, k:i+1]
+            )
+            if total_traj_err < err_threshold:  # 全局固定阈值
+                subproblem_waypoints_count, subproblem_waypoints = memo[k]
+                total_waypoints_count = 1 + subproblem_waypoints_count
+                if total_waypoints_count < min_waypoints_required:
+                    min_waypoints_required = total_waypoints_count
+                    best_waypoints = subproblem_waypoints + [i]
+        memo[i] = (min_waypoints_required, best_waypoints)
+
+    _, waypoints = memo[num_frames - 1]
+    waypoints += initial_waypoints
+    waypoints = sorted(set(waypoints))
+    return waypoints
+```
+
+##### dp_entropy_waypoint_selection()（熵加权 AWE*，第 110-204 行）
+
+```python
+def dp_entropy_waypoint_selection(
+    env=None, actions=None, entropy=None, gt_states=None,
+    err_threshold=None, initial_states=None,
+    remove_obj=None, pos_only=False,
+):
+    if gt_states is None:
+        gt_states = copy.deepcopy(actions)
+
+    num_frames = len(actions)
+    entropy_weights = calculate_weights_from_entropy(entropy)  # weights = entropy * 0.4
+    all_err_threshold = err_threshold * entropy_weights  # 逐步自适应阈值
+
+    initial_waypoints = [num_frames - 1]
+    memo = {}
+    func = fast_geometric_waypoint_trajectory
+    distance_func = (
+        get_all_pos_only_geometric_distance_gpu if pos_only
+        else get_all_geometric_distance_gpu
+    )
+    all_distance = distance_func(gt_states)
+
+    for i in range(num_frames):
+        memo[i] = (0, [])
+    memo[1] = (1, [1])
+
+    for i in range(2, num_frames):
+        min_waypoints_required = float("inf")
+        best_waypoints = []
+        for k in range(max(1, i-4), i):  # 限制搜索窗口为 4
+            waypoints = [j - k for j in initial_waypoints if j >= k and j < i] + [i - k]
+            total_traj_err, all_traj_err = func(
+                actions=actions[k:i+1], gt_states=gt_states[k:i+1],
+                waypoints=waypoints,
+                all_distance=all_distance[k:i+1, k:i+1, k:i+1],
+                return_list=True
+            )
+            # 关键：逐点检查，每个时间步使用各自的熵加权阈值
+            if (np.array(all_traj_err) <= all_err_threshold[k:i+1]).all():
+                subproblem_waypoints_count, subproblem_waypoints = memo[k]
+                total_waypoints_count = 1 + subproblem_waypoints_count
+                if total_waypoints_count < min_waypoints_required:
+                    min_waypoints_required = total_waypoints_count
+                    best_waypoints = subproblem_waypoints + [i]
+        memo[i] = (min_waypoints_required, best_waypoints)
+
+    _, waypoints = memo[num_frames - 1]
+    waypoints += initial_waypoints
+    waypoints = sorted(set(waypoints))
+    return waypoints
+```
+
+#### AWE vs AWE* 关键公式差异
+
+##### 原始 AWE DP（`dp_waypoint_selection`）
+
+**优化目标：**
+
+$$
+\min |W| \quad \text{s.t.} \quad \forall \text{segment } [w_j, w_{j+1}]: \max_{i \in [w_j, w_{j+1}]} d(s_i, s_{w_j}, s_{w_{j+1}}) < \epsilon
+$$
+
+其中 $\epsilon$ 为全局固定阈值。
+
+**DP 递推：**
+
+$$
+\text{memo}[i] = \min_{k \in [1, i)} \left(1 + \text{memo}[k].\text{count}\right) \quad \text{s.t.} \quad E(S[k:i+1]) < \epsilon
+$$
+
+##### AWE*（`dp_entropy_waypoint_selection`）
+
+**优化目标：**
+
+$$
+\min |W| \quad \text{s.t.} \quad \forall t: d(s_t, s_{w_{seg(t)}}, s_{w_{seg(t)+1}}) \leq \epsilon_t
+$$
+
+其中 $\epsilon_t = \epsilon_{base} \times (H_t \times 0.4)$ 为熵加权的逐步阈值。
+
+**DP 递推（搜索窗口限制为 4）：**
+
+$$
+\text{memo}[i] = \min_{k \in [\max(1, i-4), i)} \left(1 + \text{memo}[k].\text{count}\right) \quad \text{s.t.} \quad \forall t \in [k, i]: e_t \leq \epsilon_t
+$$
+
+#### 伪代码：AWE* 完整流程
+
+```
+输入: 关节角度轨迹 Q = {q_0, q_1, ..., q_{N-1}},
+      动作熵序列 H = {H_0, H_1, ..., H_{N-1}},
+      基础误差阈值 ε_base
+输出: 下采样后的路标点索引集合 W
+
+# 步骤 1：计算熵权重
+for t = 0 to N-1:
+    w_t = H_t × 0.4
+
+# 步骤 2：计算逐步误差阈值
+for t = 0 to N-1:
+    ε_t = ε_base × w_t
+
+# 步骤 3：预计算几何距离矩阵
+all_distance = compute_geometric_distance_gpu(Q)
+# all_distance[i,j,k] = 点 i 到线段 (j,k) 的 point-to-line 距离
+
+# 步骤 4：动态规划
+memo[0] = (count=0, waypoints=[])
+memo[1] = (count=1, waypoints=[1])
+
+for i = 2 to N-1:
+    best = (count=+∞, waypoints=[])
+
+    for k = max(1, i-4) to i-1:
+        # 计算 [k, i] 段内每个点的重建误差
+        segment_errors = []
+        for t = k to i:
+            err_t = all_distance[t, k, i]  # 点 t 到线段 (k, i) 的距离
+            segment_errors.append(err_t)
+
+        # 逐点检查：每个点的误差不超过其对应的熵加权阈值
+        if ALL(segment_errors[t-k] ≤ ε_{t}) for t in [k..i]:
+            candidate_count = 1 + memo[k].count
+            if candidate_count < best.count:
+                best = (count=candidate_count, waypoints=memo[k].waypoints + [i])
+
+    memo[i] = best
+
+# 步骤 5：提取最终路标点
+W = memo[N-1].waypoints ∪ {N-1}
+W = sort(unique(W))
+
+return W
+```
+
+#### AWE* 与 AWE 的核心区别总结
+
+| 特性 | AWE (dp_waypoint_selection) | AWE* (dp_entropy_waypoint_selection) |
+|------|---------------------------|--------------------------------------|
+| 误差阈值 | 全局固定 $\epsilon$ | 逐步自适应 $\epsilon_t = \epsilon \times H_t \times 0.4$ |
+| 误差检查 | 段内最大误差 < $\epsilon$ | 逐点误差 ≤ $\epsilon_t$ |
+| 搜索窗口 | `range(1, i)` — 全范围搜索 | `range(max(1, i-4), i)` — 限制窗口为 4 |
+| 计算复杂度 | $O(N^2)$ | $O(N \times 4) = O(N)$ |
+| 阈值调整目标 | 最小化路标数 | 调整阈值使轨迹缩短至 ~2× |
+| 熵加权 | ❌ | ✅ 低熵区域容忍更大误差，高熵区域更严格 |
+
+---
+
+### 基线方法三：恒定 2×（Constant 2×）
+
+#### 方法描述
+
+最简单的均匀下采样策略——对演示轨迹中的动作序列以**固定步长 2** 进行下采样，即每隔一帧取一帧，将轨迹长度缩短为原始的 $\frac{1}{2}$。
+
+#### 公式
+
+给定原始动作序列 $\{a_0, a_1, a_2, ..., a_{N-1}\}$：
+
+$$
+\text{downsampled} = \{a_0, a_2, a_4, ..., a_{2\lfloor(N-1)/2\rfloor}\}
+$$
+
+等价于 Python 中的 `action[::2]`。
+
+**下采样后轨迹长度：**
+
+$$
+N' = \lceil N / 2 \rceil
+$$
+
+#### 代码位置
+
+在 `robobase/robobase/replay_buffer/uniform_replay_buffer.py` 第 840 行，可以看到被注释掉的恒定 2× 下采样实现：
+
+```python
+# constant
+# action_seq = episode[ACTION][action_start_idx:][::2][:(action_end_idx-action_start_idx)]
+```
+
+这行代码展示了恒定 2× 的实现方式：
+- `episode[ACTION][action_start_idx:]`：从起始索引截取动作序列
+- `[::2]`：每隔一帧取样（步长为 2）
+- `[:(action_end_idx-action_start_idx)]`：截取到目标长度
+
+#### 伪代码
+
+```
+输入: 动作序列 action[0..N-1]
+输出: 下采样后的动作序列
+
+stride = 2
+indices = [0, 2, 4, 6, ..., 2*⌊(N-1)/2⌋]
+downsampled_action = action[indices]
+
+return downsampled_action
+```
+
+#### 对于 Aloha 的实现方式
+
+在 Aloha 环境中，恒定 2× 下采样通过 `--constant_waypoint 2` 参数指定：
+
+**命令行参数定义**（`aloha/act/imitate_episodes.py`，第 870-875 行）：
+```python
+parser.add_argument(
+    "--constant_waypoint",
+    action="store",
+    type=int,
+    help="constant_waypoint",
+    required=False,
+)
+```
+
+**参数传递**（第 47 行和第 154 行）：
+```python
+constant_waypoint = args["constant_waypoint"]
+# ...
+train_dataloader, val_dataloader, stats, _ = load_data(
+    dataset_dir, num_episodes, camera_names,
+    batch_size_train, batch_size_val,
+    speedup, constant_waypoint, policy_class,
+)
+```
+
+**数据集中的使用**（`aloha/act/act_utils.py`，第 224、234 行）：
+```python
+class EpisodicDataset(torch.utils.data.Dataset):
+    def __init__(self, ..., constant_waypoint=None, ...):
+        self.constant_waypoint = constant_waypoint
+```
+
+#### 特点
+
+- **无需任何先验信息**：不需要熵、接触信息或策略
+- **确定性**：结果完全可预测
+- **均匀丢失信息**：在所有区域（无论复杂度高低）均匀丢失相同比例的帧
+- **可能丢失关键帧**：精确操作时刻（如抓取、放置）可能恰好被跳过
+
+---
+
+### 基线方法四：恒定 3×（Constant 3×）
+
+#### 方法描述
+
+与恒定 2× 类似，但以**固定步长 3** 进行下采样，即每 3 帧取 1 帧，将轨迹长度缩短为原始的 $\frac{1}{3}$。
+
+#### 公式
+
+给定原始动作序列 $\{a_0, a_1, a_2, ..., a_{N-1}\}$：
+
+$$
+\text{downsampled} = \{a_0, a_3, a_6, ..., a_{3\lfloor(N-1)/3\rfloor}\}
+$$
+
+等价于 Python 中的 `action[::3]`。
+
+**下采样后轨迹长度：**
+
+$$
+N' = \lceil N / 3 \rceil
+$$
+
+#### 伪代码
+
+```
+输入: 动作序列 action[0..N-1]
+输出: 下采样后的动作序列
+
+stride = 3
+indices = [0, 3, 6, 9, ..., 3*⌊(N-1)/3⌋]
+downsampled_action = action[indices]
+
+return downsampled_action
+```
+
+#### 代码实现
+
+类似恒定 2× 的实现方式，修改步长为 3：
+
+```python
+# 恒定 3× 下采样
+action_seq = episode[ACTION][action_start_idx:][::3][:(action_end_idx-action_start_idx)]
+```
+
+或通过 `--constant_waypoint 3` 参数指定。
+
+#### 特点
+
+- 下采样更激进，信息损失更大
+- 轨迹长度缩短至原始的 1/3
+- **更容易丢失关键帧**：跳过的帧更多，精确操作时刻被跳过的概率更高
+- 用于对比验证均匀下采样的极限
+
+---
+
+### Section 7.1 四种方法的完整对比
+
+| 特性 | Contact Oracle | AWE* | 恒定 2× | 恒定 3× |
+|------|---------------|------|---------|---------|
+| **下采样方式** | 接触事件驱动分区 | DP + 熵加权阈值 | 均匀步长 2 | 均匀步长 3 |
+| **需要 Oracle/先验** | ✅ 3D 接触信息 | ❌ | ❌ | ❌ |
+| **需要策略熵** | ❌ | ✅（用于加权） | ❌ | ❌ |
+| **自适应性** | 按接触事件自适应 | 按熵逐步自适应 | 无（均匀） | 无（均匀） |
+| **目标加速比** | ~2× | ~2× | 2× | 3× |
+| **信息保留策略** | 保留接触变化时刻 | 保留高误差/高熵区域 | 均匀丢失 | 均匀丢失 |
+| **计算复杂度** | O(N)（在线检测） | O(N)（DP 搜索窗口=4） | O(1) | O(1) |
+| **真实世界适用性** | ❌（需 3D 信息） | ✅ | ✅ | ✅ |
+
+#### 核心公式对比
+
+| 方法 | 下采样索引计算 |
+|------|--------------|
+| **Contact Oracle** | $\text{indices} = \begin{cases} \text{dense sampling} & \text{if } \|\text{contacts}_t - \text{contacts}_{t-1}\| > 0 \text{ (within Δt)} \\ \text{sparse sampling} & \text{otherwise} \end{cases}$ |
+| **AWE\*** | $\text{indices} = \text{DP}(\min\|W\| \text{ s.t. } \forall t: d_t \leq \epsilon \times H_t \times 0.4)$ |
+| **恒定 2×** | $\text{indices} = \{0, 2, 4, ..., 2\lfloor(N-1)/2\rfloor\}$ |
+| **恒定 3×** | $\text{indices} = \{0, 3, 6, ..., 3\lfloor(N-1)/3\rfloor\}$ |
+
+---
+
+### DemoSpeedup 相对于四种基线的优势
+
+1. **相对于 Contact Oracle**：不需要 Oracle 信息和 3D 先验，可直接从 2D 相机输入中通过策略熵估计获取精度标签
+2. **相对于 AWE\***：DemoSpeedup 使用相同的熵加权 DP 框架，但结合了运行时自适应下采样（`process_action_label`），在训练阶段动态调整跳帧策略
+3. **相对于恒定 2×/3×**：DemoSpeedup 根据轨迹各段的复杂度自适应调整下采样率，在简单运动区域跳更多帧（4步），在精确操作区域保留更多帧（2步），避免均匀下采样导致的关键帧丢失
